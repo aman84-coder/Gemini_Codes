@@ -5,7 +5,7 @@
 # ==========================================
 CLUSTER_IP="your_cluster_mgmt_ip"
 SSH_USER="your_ssh_user"
-VOL_FILE="volumes.txt" # The text file containing your volume names
+VOL_FILE="volumes.txt"
 
 # Email Configuration
 EMAIL_FROM="storage-reports@onitygroup.com"
@@ -23,6 +23,7 @@ fi
 # ==========================================
 # Fetch Data from ONTAP
 # ==========================================
+echo "Fetching volume data from ONTAP cluster..."
 RAW_DATA=$(ssh -q -o StrictHostKeyChecking=no -o BatchMode=yes "$SSH_USER@$CLUSTER_IP" \
     "set -rows 0; volume show -fields vserver,volume,files-used,used")
 
@@ -34,9 +35,7 @@ fi
 # ==========================================
 # Parse Data and Generate HTML Table Rows
 # ==========================================
-# awk reads the volumes.txt file first, stores the target volumes in an array, 
-# and then only generates HTML rows if the ONTAP volume matches one in the array.
-
+echo "Parsing data against $VOL_FILE..."
 TABLE_ROWS=$(echo "$RAW_DATA" | awk -v vol_file="$VOL_FILE" '
 BEGIN {
     # Read the target volumes into memory before processing the ONTAP output
@@ -73,7 +72,7 @@ if [ -z "$TABLE_ROWS" ]; then
 fi
 
 # ==========================================
-# Construct the Final HTML Email
+# Construct the Final HTML
 # ==========================================
 HTML_CONTENT="
 <html>
@@ -100,15 +99,31 @@ HTML_CONTENT="
 "
 
 # ==========================================
-# Send the Email
+# Send the Email (Python 3 SMTP Bypass)
 # ==========================================
-(
-echo "From: $EMAIL_FROM"
-echo "To: $EMAIL_TO"
-echo "Subject: $SUBJECT"
-echo "Content-Type: text/html; charset=utf-8"
-echo ""
-echo "$HTML_CONTENT"
-) | /usr/sbin/sendmail -t
+# We export these variables so Python can securely read them from the environment
+export EMAIL_FROM EMAIL_TO SUBJECT HTML_CONTENT
 
-echo "Report generated and sent to $EMAIL_TO."
+echo "Generating email via local SMTP..."
+
+python3 -c '
+import smtplib, os
+from email.mime.text import MIMEText
+
+try:
+    # Construct the email
+    msg = MIMEText(os.environ["HTML_CONTENT"], "html", "utf-8")
+    msg["Subject"] = os.environ["SUBJECT"]
+    msg["From"] = os.environ["EMAIL_FROM"]
+    msg["To"] = os.environ["EMAIL_TO"]
+
+    # Connect to local mail server and send
+    server = smtplib.SMTP("localhost")
+    server.send_message(msg)
+    server.quit()
+    print(f"Success: Report generated and sent to {os.environ[\"EMAIL_TO\"]}.")
+except ConnectionRefusedError:
+    print("Error: Could not connect to localhost on port 25. Is Sendmail/Postfix running?")
+except Exception as e:
+    print(f"Error sending email: {e}")
+'
