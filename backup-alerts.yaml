@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Event-driven architecture for monitoring AWS Backup, Copy, and Restore failures via SNS.'
+Description: 'Event-driven architecture for monitoring AWS Backup failures with human-readable SNS email alerts.'
 
 Parameters:
   AlertEmailAddress:
@@ -12,7 +12,7 @@ Resources:
   BackupFailureTopic:
     Type: AWS::SNS::Topic
     Properties:
-      TopicName: AWS-Backup-Failures-Alerts
+      TopicName: AWS-Backup-Failures-Formatted
       Subscription:
         - Endpoint: !Ref AlertEmailAddress
           Protocol: email
@@ -34,8 +34,8 @@ Resources:
   BackupFailureEventRule:
     Type: AWS::Events::Rule
     Properties:
-      Name: AWSBackupFailureRule
-      Description: 'Captures FAILED or ABORTED AWS Backup, Copy, and Restore jobs.'
+      Name: AWSBackupFailureFormattedRule
+      Description: 'Captures FAILED or ABORTED jobs and formats the output.'
       State: ENABLED
       EventPattern:
         source:
@@ -50,4 +50,26 @@ Resources:
             - ABORTED
       Targets:
         - Arn: !Ref BackupFailureTopic
-          Id: SNS-Target-Backup-Alerts
+          Id: SNS-Target-Formatted-Alerts
+          InputTransformer:
+            InputPathsMap:
+              jobType: "$.detail-type"
+              account: "$.account"
+              region: "$.region"
+              state: "$.detail.state"
+              resourceArn: "$.detail.resourceArn"
+              statusMessage: "$.detail.statusMessage"
+            InputTemplate: |
+              "⚠️ AWS Data Protection Alert ⚠️"
+              " "
+              "A job has failed in your AWS environment."
+              " "
+              "Job Type: <jobType>"
+              "State: <state>"
+              "Account: <account>"
+              "Region: <region>"
+              "Resource ARN: <resourceArn>"
+              " "
+              "Error Details: <statusMessage>"
+              " "
+              "Please investigate via the AWS Backup console."
