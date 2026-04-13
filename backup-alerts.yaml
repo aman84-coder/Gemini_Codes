@@ -1,0 +1,51 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Event-driven architecture for monitoring AWS Backup failures and alerting via SNS.'
+
+Parameters:
+  AlertEmailAddress:
+    Type: String
+    Description: 'The email address that will receive the failure notifications.'
+    AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
+    ConstraintDescription: 'Must be a valid email address.'
+
+Resources:
+  BackupFailureTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: AWS-Backup-Failures-Alerts
+      Subscription:
+        - Endpoint: !Ref AlertEmailAddress
+          Protocol: email
+
+  BackupFailureTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sns:Publish
+            Resource: !Ref BackupFailureTopic
+      Topics:
+        - !Ref BackupFailureTopic
+
+  BackupFailureEventRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: AWSBackupFailureRule
+      Description: 'Captures FAILED or ABORTED AWS Backup jobs.'
+      State: ENABLED
+      EventPattern:
+        source:
+          - aws.backup
+        detail-type:
+          - Backup Job State Change
+        detail:
+          state:
+            - FAILED
+            - ABORTED
+      Targets:
+        - Arn: !Ref BackupFailureTopic
+          Id: SNS-Target-Backup-Alerts
