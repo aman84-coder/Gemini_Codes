@@ -1,14 +1,14 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Event-driven architecture for monitoring AWS Backup failures with human-readable SNS email alerts.'
+Description: 'Event-driven architecture for monitoring AWS Backup failures with a custom email subject line via Lambda.'
 
 Parameters:
   AlertEmailAddress:
     Type: String
     Description: 'The email address that will receive the failure notifications.'
     AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
-    ConstraintDescription: 'Must be a valid email address.'
 
 Resources:
+  # 1. The SNS Topic
   BackupFailureTopic:
     Type: AWS::SNS::Topic
     Properties:
@@ -17,25 +17,93 @@ Resources:
         - Endpoint: !Ref AlertEmailAddress
           Protocol: email
 
-  BackupFailureTopicPolicy:
-    Type: AWS::SNS::TopicPolicy
+  # 2. IAM Role for Lambda to publish to SNS
+  BackupAlertLambdaRole:
+    Type: AWS::IAM::Role
     Properties:
-      PolicyDocument:
+      AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement:
           - Effect: Allow
             Principal:
-              Service: events.amazonaws.com
-            Action: sns:Publish
-            Resource: !Ref BackupFailureTopic
-      Topics:
-        - !Ref BackupFailureTopic
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: PublishToSNSAndLog
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref BackupFailureTopic
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogGroup
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: arn:aws:logs:*:*:*
 
+  # 3. The Lambda Function
+  BackupAlertLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: FormatBackupAlerts
+      Handler: index.lambda_handler
+      Role: !GetAtt BackupAlertLambdaRole.Arn
+      Runtime: python3.12
+      Timeout: 10
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref BackupFailureTopic
+      Code:
+        ZipFile: |
+          import boto3
+          import os
+          import json
+
+          sns = boto3.client('sns')
+
+          def lambda_handler(event, context):
+              topic_arn = os.environ['SNS_TOPIC_ARN']
+              
+              job_type = event.get('detail-type', 'AWS Backup Job')
+              account = event.get('account', 'Unknown')
+              region = event.get('region', 'Unknown')
+              detail = event.get('detail', {})
+              state = detail.get('state', 'FAILED')
+              resource = detail.get('resourceArn', 'Unknown')
+              error = detail.get('statusMessage', 'No error message provided.')
+              
+              # --- CUSTOMIZE YOUR SUBJECT LINE HERE ---
+              subject = f"🚨 AWS Backup {state}: Action Required in {account}"
+              
+              message = f"""⚠️ AWS Data Protection Alert ⚠️
+              
+              A job has failed in your AWS environment.
+              
+              Job Type: {job_type}
+              State: {state}
+              Account: {account}
+              Region: {region}
+              Resource ARN: {resource}
+              
+              Error Details: {error}
+              
+              Please investigate via the AWS Backup console."""
+              
+              # SNS enforces a strict 100-character limit on Subject lines
+              sns.publish(
+                  TopicArn=topic_arn,
+                  Subject=subject[:100], 
+                  Message=message
+              )
+
+  # 4. EventBridge Rule targeting Lambda
   BackupFailureEventRule:
     Type: AWS::Events::Rule
     Properties:
       Name: AWSBackupFailureFormattedRule
-      Description: 'Captures FAILED or ABORTED jobs and formats the output.'
+      Description: 'Captures FAILED or ABORTED jobs and routes to Lambda for formatting.'
       State: ENABLED
       EventPattern:
         source:
@@ -49,27 +117,14 @@ Resources:
             - FAILED
             - ABORTED
       Targets:
-        - Arn: !Ref BackupFailureTopic
-          Id: SNS-Target-Formatted-Alerts
-          InputTransformer:
-            InputPathsMap:
-              jobType: "$.detail-type"
-              account: "$.account"
-              region: "$.region"
-              state: "$.detail.state"
-              resourceArn: "$.detail.resourceArn"
-              statusMessage: "$.detail.statusMessage"
-            InputTemplate: |
-              "⚠️ AWS Data Protection Alert ⚠️"
-              " "
-              "A job has failed in your AWS environment."
-              " "
-              "Job Type: <jobType>"
-              "State: <state>"
-              "Account: <account>"
-              "Region: <region>"
-              "Resource ARN: <resourceArn>"
-              " "
-              "Error Details: <statusMessage>"
-              " "
-              "Please investigate via the AWS Backup console."
+        - Arn: !GetAtt BackupAlertLambda.Arn
+          Id: Lambda-Target-Formatted-Alerts
+
+  # 5. Permission for EventBridge to invoke Lambda
+  EventBridgeInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref BackupAlertLambda
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt BackupFailureEventRule.Arn
