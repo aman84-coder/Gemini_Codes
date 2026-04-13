@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Event-driven architecture for monitoring AWS Backup failures and alerting via SNS.'
+Description: 'Event-driven architecture for monitoring AWS Backup, Copy, and Restore failures via SNS.'
 
 Parameters:
   AlertEmailAddress:
@@ -35,13 +35,15 @@ Resources:
     Type: AWS::Events::Rule
     Properties:
       Name: AWSBackupFailureRule
-      Description: 'Captures FAILED or ABORTED AWS Backup jobs.'
+      Description: 'Captures FAILED or ABORTED AWS Backup, Copy, and Restore jobs.'
       State: ENABLED
       EventPattern:
         source:
           - aws.backup
         detail-type:
           - Backup Job State Change
+          - Copy Job State Change
+          - Restore Job State Change
         detail:
           state:
             - FAILED
