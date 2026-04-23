@@ -23,24 +23,20 @@ echo "==========================================================================
 # ==============================================================================
 # Execution Loop
 # ==============================================================================
-# Read the file line by line. IFS= ensures trailing spaces don't break the read.
 while IFS= read -r VOL_NAME || [[ -n "$VOL_NAME" ]]; do
     
-    # Trim leading/trailing whitespace and skip empty lines or comments (#)
+    # Trim whitespace and skip empty lines/comments
     VOL_NAME=$(echo "$VOL_NAME" | xargs)
     [[ -z "$VOL_NAME" || "$VOL_NAME" == \#* ]] && continue
 
     echo ">>> Processing Volume: $VOL_NAME"
 
-    # SSH into the cluster and execute the commands.
-    # -o BatchMode=yes prevents SSH from prompting for a password if keys fail.
-    # set -confirmations off bypasses the ONTAP interactive "Are you sure?" prompt.
-    ssh -o BatchMode=yes -o StrictHostKeyChecking=no "${SSH_USER}@${CLUSTER_IP}" \
+    # Added -n flag to prevent SSH from consuming the while loop's stdin
+    ssh -n -o BatchMode=yes -o StrictHostKeyChecking=no "${SSH_USER}@${CLUSTER_IP}" \
         "set -confirmations off; \
          volume offline -vserver ${VSERVER} -volume ${VOL_NAME}; \
          volume destroy -vserver ${VSERVER} -volume ${VOL_NAME}"
 
-    # Check the exit status of the SSH command
     if [[ $? -eq 0 ]]; then
         echo "[SUCCESS] Offlined and destroyed: $VOL_NAME"
     else
