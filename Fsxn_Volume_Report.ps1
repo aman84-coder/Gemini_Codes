@@ -2,21 +2,23 @@
 Import-Module DataONTAP
 
 # --- Configuration ---
-$FSxNManagementIP = "10.0.1.50" # Replace with your FSxN Management Endpoint IP
+# Ensure this is the Cluster Management IP, NOT the SVM IP
+$FSxNManagementIP = "10.0.1.50" 
 $SMTPServer       = "localhost" # Local SMTP relay
 $EmailTo          = "infraops@yourcompany.com"
 $EmailFrom        = "fsxn-reporter@yourcompany.com"
 $EmailSubject     = "FSxN Volume Report - $(Get-Date -Format 'yyyy-MM-dd')"
 $CsvPath          = "C:\Temp\FSxN_Volume_Report_$(Get-Date -Format 'yyyyMMdd').csv"
 
-# Credentials (Retrieve dynamically in production)
+# Credentials
 $Username = "fsxadmin"
-$Password = ConvertTo-SecureString "YourSecurePassword!" -AsPlainText -Force
+# Note: Using single quotes prevents PowerShell from misinterpreting special characters like $ or @
+$Password = ConvertTo-SecureString 'YourExactPasswordHere!' -AsPlainText -Force
 $Creds    = New-Object System.Management.Automation.PSCredential ($Username, $Password)
 
 try {
     # Connect to the FSxN Controller
-    Write-Output "Connecting to FSxN Controller..."
+    Write-Output "Connecting to FSxN Controller ($FSxNManagementIP)..."
     Connect-NcController -Name $FSxNManagementIP -Credential $Creds -ErrorAction Stop
 
     # Fetch all volumes
@@ -24,18 +26,36 @@ try {
     $Volumes = Get-NcVol
 
     # Build the custom dataset
+    Write-Output "Processing volume metrics..."
     $ReportData = foreach ($Vol in $Volumes) {
         
-        # Retrieve the specific snapdir-access option for the current volume
-        $SnapDirOption = Get-NcVolOption -Volume $Vol.Name -Key "snapdir-access"
+        # 1. Fetch snapdir-access option safely
+        $SnapDirOption = Get-NcVolOption -Name $Vol.Name | Where-Object { $_.Name -eq "snapdir-access" }
+        $SnapDirValue = if ($SnapDirOption) { $SnapDirOption.Value } else { "N/A" }
+
+        # 2. Unpack the nested Tiering Policy
+        $TieringPolicy = if ($null -ne $Vol.VolumeTieringAttributes.TieringPolicy) {
+            $Vol.VolumeTieringAttributes.TieringPolicy
+        } elseif ($null -ne $Vol.TieringPolicy) {
+            $Vol.TieringPolicy
+        } else {
+            "None"
+        }
+
+        # 3. Target the correct Percentage Used property
+        $PercentUsed = if ($null -ne $Vol.PercentageSizeUsed) {
+            $Vol.PercentageSizeUsed
+        } else {
+            $Vol.PercentageUsed
+        }
 
         # Construct the object with exact requested headers
         [PSCustomObject]@{
             "volume"         = $Vol.Name
-            "used"           = [math]::Round($Vol.Used / 1GB, 2) # Converted bytes to GB for readability
-            "percent-used"   = $Vol.PercentageUsed
-            "Tiering-policy" = $Vol.TieringPolicy
-            "snapdir-access" = $SnapDirOption.Value
+            "used"           = [math]::Round($Vol.Used / 1GB, 2) 
+            "percent-used"   = $PercentUsed
+            "Tiering-policy" = $TieringPolicy
+            "snapdir-access" = $SnapDirValue
         }
     }
 
@@ -60,7 +80,7 @@ try {
     Write-Error "Failed to execute reporting script: $($_.Exception.Message)"
 } finally {
     # Clean up the session and temp files
-    if (Get-NcController) { 
+    if (Get-NcController -ErrorAction SilentlyContinue) { 
         Invoke-NcSystemApi -Name "security-api-session-delete" -ErrorAction SilentlyContinue 
     }
     if (Test-Path $CsvPath) {
