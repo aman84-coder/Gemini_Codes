@@ -29,9 +29,17 @@ try {
     Write-Output "Processing volume metrics..."
     $ReportData = foreach ($Vol in $Volumes) {
         
-        # 1. Fetch snapdir-access option safely
-        $SnapDirOption = Get-NcVolOption -Name $Vol.Name | Where-Object { $_.Name -eq "snapdir-access" }
-        $SnapDirValue = if ($SnapDirOption) { $SnapDirOption.Value } else { "N/A" }
+        # 1. Looser match for snapdir-access (checks both Name and OptionName properties)
+        $SnapDirOption = Get-NcVolOption -Name $Vol.Name | Where-Object { 
+            $_.Name -match "snapdir-access" -or $_.OptionName -match "snapdir-access" 
+        }
+        $SnapDirValue = if ($SnapDirOption.Value) { 
+            $SnapDirOption.Value 
+        } elseif ($SnapDirOption.OptionValue) { 
+            $SnapDirOption.OptionValue 
+        } else { 
+            "N/A" 
+        }
 
         # 2. Unpack the nested Tiering Policy
         $TieringPolicy = if ($null -ne $Vol.VolumeTieringAttributes.TieringPolicy) {
@@ -42,11 +50,11 @@ try {
             "None"
         }
 
-        # 3. Target the correct Percentage Used property
-        $PercentUsed = if ($null -ne $Vol.PercentageSizeUsed) {
-            $Vol.PercentageSizeUsed
-        } else {
-            $Vol.PercentageUsed
+        # 3. Bulletproof Manual Percentage Calculation
+        $PercentUsed = if ($Vol.TotalSize -gt 0) { 
+            [math]::Round(($Vol.Used / $Vol.TotalSize) * 100, 2) 
+        } else { 
+            0 
         }
 
         # Construct the object with exact requested headers
