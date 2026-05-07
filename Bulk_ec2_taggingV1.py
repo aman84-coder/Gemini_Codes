@@ -4,26 +4,20 @@ import os
 
 # Configuration
 CSV_FILE = 'ec2_multiregion_tags.csv'
-# Optional: Define specific regions if you don't want to scan everything
-# REGIONS = ['us-east-1', 'us-west-2'] 
-
-def get_all_regions():
-    """Fetches all enabled regions for the account."""
-    client = boto3.client('ec2', region_name='us-east-1')
-    regions = [region['RegionName'] for region in client.describe_regions()['Regions']]
-    return regions
+# Restricted to your specific regions
+TARGET_REGIONS = ['us-east-1', 'us-east-2'] 
 
 def export_tags():
-    """Phase 1: Export tags from all regions into one CSV."""
-    regions = get_all_regions()
-    print(f"Starting export across {len(regions)} regions...")
+    """Phase 1: Export tags from us-east-1 and us-east-2 into one CSV."""
+    print(f"Starting export for regions: {TARGET_REGIONS}...")
 
     with open(CSV_FILE, mode='w', newline='', encoding='utf-8') as f:
         writer = csv.writer(f)
         writer.writerow(['Region', 'InstanceID', 'Tags', 'Action'])
 
-        for region in regions:
+        for region in TARGET_REGIONS:
             print(f"Scanning {region}...")
+            # Initialize client for specific region
             ec2 = boto3.client('ec2', region_name=region)
             try:
                 paginator = ec2.get_paginator('describe_instances')
@@ -31,31 +25,39 @@ def export_tags():
                     for res in page['Reservations']:
                         for inst in res['Instances']:
                             inst_id = inst['InstanceId']
+                            
+                            # Build the single-column tag string
                             tag_list = [f"{t['Key']}={t['Value']}" for t in inst.get('Tags', [])]
                             tags_string = ";".join(tag_list)
+                            
                             writer.writerow([region, inst_id, tags_string, 'KEEP'])
             except Exception as e:
-                print(f"Could not scan region {region}: {e}")
+                print(f"Error scanning {region}: {e}")
 
-    print(f"Export complete: {CSV_FILE}")
+    print(f"Export complete. File saved as: {CSV_FILE}")
 
 def apply_tags():
-    """Phase 2: Read CSV and apply updates to specific regions."""
+    """Phase 2: Read CSV and apply updates to us-east-1 and us-east-2."""
     if not os.path.exists(CSV_FILE):
         print(f"Error: {CSV_FILE} not found.")
         return
 
+    print("Applying updates from CSV...")
     with open(CSV_FILE, mode='r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f)
         for row in reader:
+            # Only process if Action is UPDATE and region is in our allowed list
             if row.get('Action', '').upper() != 'UPDATE':
                 continue
-
+            
             region = row['Region']
+            if region not in TARGET_REGIONS:
+                print(f"Skipping row: Region {region} is not in allowed list.")
+                continue
+
             inst_id = row['InstanceID']
             raw_tags = row['Tags']
             
-            # Re-initialize client for each row's specific region
             ec2 = boto3.client('ec2', region_name=region)
             
             new_tags = []
@@ -68,9 +70,9 @@ def apply_tags():
             if new_tags:
                 try:
                     ec2.create_tags(Resources=[inst_id], Tags=new_tags)
-                    print(f"[{region}] Updated {inst_id}")
+                    print(f"[{region}] Successfully updated {inst_id}")
                 except Exception as e:
-                    print(f"[{region}] Failed {inst_id}: {e}")
+                    print(f"[{region}] Failed to update {inst_id}: {e}")
 
 if __name__ == "__main__":
     import sys
