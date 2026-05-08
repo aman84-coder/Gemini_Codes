@@ -12,36 +12,45 @@ if [[ ! -f "$VOL_FILE" ]]; then
     exit 1
 fi
 
+echo "-------------------------------------------" | tee -a "$LOG_FILE"
 echo "Starting volume check at $(date)" | tee -a "$LOG_FILE"
+echo "-------------------------------------------" | tee -a "$LOG_FILE"
 
-# Iterate through each volume in the text file
+# Use a while loop to read the file
 while IFS= read -r vol_name || [[ -n "$vol_name" ]]; do
     # Skip empty lines or comments
     [[ -z "$vol_name" || "$vol_name" =~ ^# ]] && continue
 
-    echo "Checking volume: $vol_name"
+    # Trim any potential carriage returns from Windows-edited files
+    vol_name=$(echo "$vol_name" | tr -d '\r' | xargs)
+
+    echo "Processing volume: $vol_name"
 
     # 1. Check current state
-    # We query the state and strip whitespace
-    CURRENT_STATE=$(ssh "$ADMIN_USER@$CLUSTER_IP" "volume show -volume $vol_name -fields state" | awk 'NR==3 {print $2}' | tr -d '\r')
+    # Added -n to prevent SSH from consuming the file stream
+    # Added -terse for easier machine parsing
+    CURRENT_STATE=$(ssh -n "$ADMIN_USER@$CLUSTER_IP" "volume show -volume $vol_name -fields state -terse" 2>/dev/null | grep "$vol_name" | awk -F',' '{print $NF}' | xargs)
 
     if [[ "$CURRENT_STATE" == "online" ]]; then
-        echo "  - Volume $vol_name is already online." | tee -a "$LOG_FILE"
+        echo "  [SKIP] Volume $vol_name is already online." | tee -a "$LOG_FILE"
+    
     elif [[ -z "$CURRENT_STATE" ]]; then
-        echo "  - Error: Volume $vol_name not found on cluster." | tee -a "$LOG_FILE"
+        echo "  [ERROR] Volume $vol_name not found or cluster unreachable." | tee -a "$LOG_FILE"
+    
     else
-        echo "  - Volume $vol_name is $CURRENT_STATE. Attempting to bring online..." | tee -a "$LOG_FILE"
+        echo "  [ACTION] Volume is $CURRENT_STATE. Bringing online..." | tee -a "$LOG_FILE"
         
-        # 2. Command to online the volume
-        ONLINE_CMD=$(ssh "$ADMIN_USER@$CLUSTER_IP" "volume online -volume $vol_name" 2>&1)
+        # 2. Command to online the volume (with -n flag)
+        ONLINE_CMD=$(ssh -n "$ADMIN_USER@$CLUSTER_IP" "volume online -volume $vol_name" 2>&1)
         
         if [[ $? -eq 0 ]]; then
-            echo "  - Success: $vol_name is now online." | tee -a "$LOG_FILE"
+            echo "  [SUCCESS] $vol_name is now online." | tee -a "$LOG_FILE"
         else
-            echo "  - Failed to online $vol_name: $ONLINE_CMD" | tee -a "$LOG_FILE"
+            echo "  [FAILED] Could not online $vol_name: $ONLINE_CMD" | tee -a "$LOG_FILE"
         fi
     fi
 
 done < "$VOL_FILE"
 
+echo "-------------------------------------------" | tee -a "$LOG_FILE"
 echo "Finished at $(date)" | tee -a "$LOG_FILE"
