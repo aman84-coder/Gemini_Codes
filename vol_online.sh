@@ -6,51 +6,54 @@ ADMIN_USER="admin"               # Cluster Admin Username
 VOL_FILE="volumes.txt"           # Text file containing volume names
 LOG_FILE="vol_online_status.log"
 
-# Check if input file exists
+# SSH Options to prevent hangs and prompt issues
+SSH_OPTS="-n -o BatchMode=yes -o StrictHostKeyChecking=no -o ConnectTimeout=5"
+
 if [[ ! -f "$VOL_FILE" ]]; then
     echo "Error: Input file '$VOL_FILE' not found."
     exit 1
 fi
 
 echo "-------------------------------------------" | tee -a "$LOG_FILE"
-echo "Starting volume check at $(date)" | tee -a "$LOG_FILE"
-echo "-------------------------------------------" | tee -a "$LOG_FILE"
+echo "Starting volume check: $(date)" | tee -a "$LOG_FILE"
 
-# Use a while loop to read the file
 while IFS= read -r vol_name || [[ -n "$vol_name" ]]; do
-    # Skip empty lines or comments
     [[ -z "$vol_name" || "$vol_name" =~ ^# ]] && continue
-
-    # Trim any potential carriage returns from Windows-edited files
+    
+    # Clean volume name (remove whitespace/carriage returns)
     vol_name=$(echo "$vol_name" | tr -d '\r' | xargs)
 
-    echo "Processing volume: $vol_name"
+    echo "Checking: $vol_name"
 
-    # 1. Check current state
-    # Added -n to prevent SSH from consuming the file stream
-    # Added -terse for easier machine parsing
-    CURRENT_STATE=$(ssh -n "$ADMIN_USER@$CLUSTER_IP" "volume show -volume $vol_name -fields state -terse" 2>/dev/null | grep "$vol_name" | awk -F',' '{print $NF}' | xargs)
+    # 1. Fetch the raw status line for the volume
+    # We use -terse to get a comma-separated format that is version-independent
+    RAW_OUT=$(ssh $SSH_OPTS "$ADMIN_USER@$CLUSTER_IP" "volume show -volume $vol_name -fields state -terse" 2>&1)
 
-    if [[ "$CURRENT_STATE" == "online" ]]; then
-        echo "  [SKIP] Volume $vol_name is already online." | tee -a "$LOG_FILE"
+    # Check if the command actually succeeded
+    if [[ $? -ne 0 ]]; then
+        echo "  [ERROR] Connection failed for $vol_name. Check SSH keys/Network." | tee -a "$LOG_FILE"
+        continue
+    fi
+
+    # 2. Extract state (look for 'online' or 'offline' in the string)
+    if [[ "$RAW_OUT" == *"online"* ]]; then
+        echo "  [SKIP] $vol_name is already online." | tee -a "$LOG_FILE"
     
-    elif [[ -z "$CURRENT_STATE" ]]; then
-        echo "  [ERROR] Volume $vol_name not found or cluster unreachable." | tee -a "$LOG_FILE"
-    
-    else
-        echo "  [ACTION] Volume is $CURRENT_STATE. Bringing online..." | tee -a "$LOG_FILE"
+    elif [[ "$RAW_OUT" == *"offline"* ]]; then
+        echo "  [ACTION] $vol_name is offline. Bringing online..." | tee -a "$LOG_FILE"
         
-        # 2. Command to online the volume (with -n flag)
-        ONLINE_CMD=$(ssh -n "$ADMIN_USER@$CLUSTER_IP" "volume online -volume $vol_name" 2>&1)
+        # Execute the online command
+        RESULT=$(ssh $SSH_OPTS "$ADMIN_USER@$CLUSTER_IP" "volume online -volume $vol_name" 2>&1)
         
         if [[ $? -eq 0 ]]; then
             echo "  [SUCCESS] $vol_name is now online." | tee -a "$LOG_FILE"
         else
-            echo "  [FAILED] Could not online $vol_name: $ONLINE_CMD" | tee -a "$LOG_FILE"
+            echo "  [FAILED] Error bringing $vol_name online: $RESULT" | tee -a "$LOG_FILE"
         fi
+    else
+        echo "  [NOT FOUND] Volume $vol_name not found or unexpected status." | tee -a "$LOG_FILE"
     fi
 
 done < "$VOL_FILE"
 
-echo "-------------------------------------------" | tee -a "$LOG_FILE"
 echo "Finished at $(date)" | tee -a "$LOG_FILE"
