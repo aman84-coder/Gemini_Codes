@@ -1,5 +1,7 @@
-import sys
+import csv
+from datetime import datetime
 from pathlib import Path
+import sys
 import boto3
 from botocore.exceptions import ClientError, ProfileNotFound
 
@@ -14,13 +16,10 @@ def load_snapshot_ids_from_file(file_path):
     snap_ids = []
     with open(path, "r", encoding="utf-8-sig") as f:
         for line in f:
-            # Strip spaces, carriage returns (\r), and newlines (\n)
             clean_line = line.strip().replace("\r", "").replace("\n", "")
             if clean_line and not clean_line.startswith("#"):
-                # Extract pure snapshot ID if copied with extra text
                 if "snap-" in clean_line:
                     start_idx = clean_line.find("snap-")
-                    # EBS Snapshot IDs are typically 'snap-' + 8 or 17 hex chars
                     raw_id = clean_line[start_idx:].split()[0].split(",")[0]
                     snap_ids.append(raw_id)
 
@@ -28,13 +27,11 @@ def load_snapshot_ids_from_file(file_path):
 
 
 def get_ami_snapshot_mapping(ec2_client):
-    """Retrieves AMIs accessible to 'self' and maps Snapshot ID -> AMI Details."""
+    """Retrieves AMIs accessible to 'self' and maps Snapshot ID -> AMI Details List."""
     ami_map = {}
     try:
-        # Check both self-owned AMIs and explicitly shared AMIs
         images_response = ec2_client.describe_images(
-            Owners=["self"],
-            ExecutableUsers=["self"]
+            Owners=["self"], ExecutableUsers=["self"]
         )
         for image in images_response.get("Images", []):
             ami_details = {
@@ -45,7 +42,10 @@ def get_ami_snapshot_mapping(ec2_client):
             }
 
             for block_device in image.get("BlockDeviceMappings", []):
-                if "Ebs" in block_device and "SnapshotId" in block_device["Ebs"]:
+                if (
+                    "Ebs" in block_device
+                    and "SnapshotId" in block_device["Ebs"]
+                ):
                     snap_id = block_device["Ebs"]["SnapshotId"]
                     if snap_id not in ami_map:
                         ami_map[snap_id] = []
@@ -58,85 +58,182 @@ def get_ami_snapshot_mapping(ec2_client):
 
 
 def fetch_snapshots_safely(ec2_client, snapshot_ids):
-    """Fetches snapshot details, querying individually if bulk requests throw NotFound errors."""
+    """Fetches snapshot details individually to prevent single missing ID failures."""
     found_snapshots = {}
 
-    # Try querying individually to avoid one missing/cross-account snapshot failing the entire batch
     for snap_id in snapshot_ids:
         try:
-            # Querying directly by SnapshotId works for both self-owned and shared snapshots
             response = ec2_client.describe_snapshots(SnapshotIds=[snap_id])
             for snap in response.get("Snapshots", []):
                 found_snapshots[snap["SnapshotId"]] = snap
         except ClientError as e:
             error_code = e.response["Error"]["Code"]
-            if error_code in ["InvalidSnapshot.NotFound", "InvalidGroup.NotFound"]:
-                pass  # Truly doesn't exist in this region or account
+            if error_code in [
+                "InvalidSnapshot.NotFound",
+                "InvalidGroup.NotFound",
+            ]:
+                pass
             else:
                 print(f"  [WARN] Could not fetch {snap_id}: {e}")
 
     return found_snapshots
 
 
-def validate_snapshots_for_profile_region(profile_name, region_name, target_snap_ids):
-    """Validates target snapshot IDs for a specific AWS Profile + Region."""
-    print(f"\n{'='*70}\nProfile: [{profile_name}] | Region: [{region_name}]\n{'='*70}")
+def export_to_csv(results, output_filename):
+    """Exports structured snapshot validation results into a CSV file."""
+    fieldnames = [
+        "AWS Profile",
+        "Account ID",
+        "Region",
+        "Snapshot ID",
+        "Snapshot Status",
+        "Is Associated with AMI",
+        "Volume Size (GB)",
+        "Snapshot Start Time",
+        "Snapshot Owner ID",
+        "Associated AMI ID",
+        "AMI Name",
+        "AMI State",
+        "AMI Creation Date",
+    ]
 
-    try:
-        session = boto3.Session(profile_name=profile_name, region_name=region_name)
-        ec2_client = session.client("ec2")
-        
-        # Verify account identity for logging
-        sts_client = session.client("sts")
-        account_id = sts_client.get_caller_identity()["Account"]
-        print(f"Connected as Account ID: {account_id}")
+    with open(
+        output_filename, mode="w", newline="", encoding="utf-8"
+    ) as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
 
-    except ProfileNotFound:
-        print(f"[ERROR] Profile '{profile_name}' not found in AWS credentials.")
-        return
-    except ClientError as e:
-        print(f"[ERROR] Authentication failed for {profile_name}: {e}")
-        return
+    print(f"\n[SUCCESS] Report exported successfully to: {output_filename}")
 
-    # 1. Fetch AMI Mapping
-    ami_map = get_ami_snapshot_mapping(ec2_client)
 
-    # 2. Safely query individual snapshots
-    found_snapshots = fetch_snapshots_safely(ec2_client, target_snap_ids)
+def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
+    """Loops through profiles and regions, validates snapshots, and exports findings to CSV."""
+    target_snap_ids = load_snapshot_ids_from_file(input_file)
+    print(
+        f"Loaded {len(target_snap_ids)} unique Snapshot IDs from '{input_file}'."
+    )
 
-    # 3. Process & Display Results
-    associated_count = 0
-    unassociated_count = 0
+    all_results = []
 
-    for snap_id in target_snap_ids:
-        if snap_id in found_snapshots:
-            snap_info = found_snapshots[snap_id]
-            size = snap_info.get("VolumeSize", "N/A")
-            owner_id = snap_info.get("OwnerId", "Unknown")
+    for profile in profiles:
+        for region in regions:
+            print(
+                f"\n{'='*70}\nProfile: [{profile}] | Region: [{region}]\n{'='*70}"
+            )
 
-            if snap_id in ami_map:
-                associated_count += 1
-                print(f"\n[+] Snapshot ID: {snap_id} ({size} GB | Owner: {owner_id}) -> ASSOCIATED")
-                for ami in ami_map[snap_id]:
-                    print(f"    └── AMI ID: {ami['AmiId']} | Name: {ami['AmiName']} | State: {ami['AmiState']}")
-            else:
-                unassociated_count += 1
-                print(f"\n[-] Snapshot ID: {snap_id} ({size} GB | Owner: {owner_id}) -> UNASSOCIATED (No active AMI)")
-        else:
-            print(f"\n[?] Snapshot ID: {snap_id} -> NOT FOUND in Account [{account_id}] / Region [{region_name}]")
+            try:
+                session = boto3.Session(
+                    profile_name=profile, region_name=region
+                )
+                ec2_client = session.client("ec2")
 
-    print(f"\nSummary for {profile_name} ({region_name}): {associated_count} Associated | {unassociated_count} Unassociated")
+                sts_client = session.client("sts")
+                account_id = sts_client.get_caller_identity()["Account"]
+                print(f"Connected as Account ID: {account_id}")
+
+            except ProfileNotFound:
+                print(
+                    f"[ERROR] Profile '{profile}' not found in AWS credentials."
+                )
+                continue
+            except ClientError as e:
+                print(
+                    f"[ERROR] Authentication/Connection failed for profile '{profile}': {e}"
+                )
+                continue
+
+            ami_map = get_ami_snapshot_mapping(ec2_client)
+            found_snapshots = fetch_snapshots_safely(
+                ec2_client, target_snap_ids
+            )
+
+            for snap_id in target_snap_ids:
+                if snap_id in found_snapshots:
+                    snap_info = found_snapshots[snap_id]
+                    size = snap_info.get("VolumeSize", "N/A")
+                    start_time = (
+                        snap_info.get("StartTime", "").strftime(
+                            "%Y-%m-%d %H:%M:%S"
+                        )
+                        if "StartTime" in snap_info
+                        else "N/A"
+                    )
+                    owner_id = snap_info.get("OwnerId", "N/A")
+
+                    if snap_id in ami_map:
+                        for ami in ami_map[snap_id]:
+                            all_results.append(
+                                {
+                                    "AWS Profile": profile,
+                                    "Account ID": account_id,
+                                    "Region": region,
+                                    "Snapshot ID": snap_id,
+                                    "Snapshot Status": "Found",
+                                    "Is Associated with AMI": "Yes",
+                                    "Volume Size (GB)": size,
+                                    "Snapshot Start Time": start_time,
+                                    "Snapshot Owner ID": owner_id,
+                                    "Associated AMI ID": ami["AmiId"],
+                                    "AMI Name": ami["AmiName"],
+                                    "AMI State": ami["AmiState"],
+                                    "AMI Creation Date": ami["CreationDate"],
+                                }
+                            )
+                    else:
+                        all_results.append(
+                            {
+                                "AWS Profile": profile,
+                                "Account ID": account_id,
+                                "Region": region,
+                                "Snapshot ID": snap_id,
+                                "Snapshot Status": "Found",
+                                "Is Associated with AMI": "No",
+                                "Volume Size (GB)": size,
+                                "Snapshot Start Time": start_time,
+                                "Snapshot Owner ID": owner_id,
+                                "Associated AMI ID": "N/A",
+                                "AMI Name": "N/A",
+                                "AMI State": "N/A",
+                                "AMI Creation Date": "N/A",
+                            }
+                        )
+                else:
+                    all_results.append(
+                        {
+                            "AWS Profile": profile,
+                            "Account ID": account_id,
+                            "Region": region,
+                            "Snapshot ID": snap_id,
+                            "Snapshot Status": "Not Found",
+                            "Is Associated with AMI": "No",
+                            "Volume Size (GB)": "N/A",
+                            "Snapshot Start Time": "N/A",
+                            "Snapshot Owner ID": "N/A",
+                            "Associated AMI ID": "N/A",
+                            "AMI Name": "N/A",
+                            "AMI State": "N/A",
+                            "AMI Creation Date": "N/A",
+                        }
+                    )
+
+    if all_results:
+        export_to_csv(all_results, output_csv)
+    else:
+        print("\n[WARN] No validation data collected.")
 
 
 if __name__ == "__main__":
     # --- CONFIGURATION ---
     INPUT_FILE = "snapshots.txt"
-    PROFILES = ["default", "production", "staging"]  # Replace with your local profile names
-    REGIONS = ["us-east-1", "us-west-2"]             # Replace with target regions
+    OUTPUT_CSV = f"snapshot_ami_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+    PROFILES = [
+        "default",
+        "production",
+        "staging",
+    ]  # Update with your local AWS profiles
+    REGIONS = ["us-east-1", "us-west-2"]  # Update with your target AWS regions
 
-    snapshot_ids = load_snapshot_ids_from_file(INPUT_FILE)
-    print(f"Loaded {len(snapshot_ids)} unique Snapshot IDs from '{INPUT_FILE}': {snapshot_ids}")
-
-    for profile in PROFILES:
-        for region in REGIONS:
-            validate_snapshots_for_profile_region(profile, region, snapshot_ids)
+    process_all_profiles_and_regions(
+        PROFILES, REGIONS, INPUT_FILE, OUTPUT_CSV
+    )
