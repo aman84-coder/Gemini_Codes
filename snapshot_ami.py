@@ -7,7 +7,7 @@ from botocore.exceptions import ClientError, ProfileNotFound
 
 
 def load_snapshot_ids_from_file(file_path):
-    """Reads snapshot IDs from a file and aggressively cleans hidden line break characters."""
+    """Reads snapshot IDs from a file and cleans hidden characters and formatting."""
     path = Path(file_path)
     if not path.is_file():
         print(f"[ERROR] File not found: {file_path}")
@@ -24,37 +24,6 @@ def load_snapshot_ids_from_file(file_path):
                     snap_ids.append(raw_id)
 
     return list(set(snap_ids))
-
-
-def get_ami_snapshot_mapping(ec2_client):
-    """Retrieves AMIs accessible to 'self' and maps Snapshot ID -> AMI Details List."""
-    ami_map = {}
-    try:
-        images_response = ec2_client.describe_images(
-            Owners=["self"], ExecutableUsers=["self"]
-        )
-        for image in images_response.get("Images", []):
-            ami_details = {
-                "AmiId": image.get("ImageId"),
-                "AmiName": image.get("Name", "N/A"),
-                "AmiState": image.get("State"),
-                "CreationDate": image.get("CreationDate"),
-            }
-
-            for block_device in image.get("BlockDeviceMappings", []):
-                if (
-                    "Ebs" in block_device
-                    and "SnapshotId" in block_device["Ebs"]
-                ):
-                    snap_id = block_device["Ebs"]["SnapshotId"]
-                    if snap_id not in ami_map:
-                        ami_map[snap_id] = []
-                    ami_map[snap_id].append(ami_details)
-
-    except ClientError as e:
-        print(f"  [ERROR] Describing images failed: {e}")
-
-    return ami_map
 
 
 def fetch_snapshots_safely(ec2_client, snapshot_ids):
@@ -74,13 +43,48 @@ def fetch_snapshots_safely(ec2_client, snapshot_ids):
             ]:
                 pass
             else:
-                print(f"  [WARN] Could not fetch {snap_id}: {e}")
+                print(f"  [WARN] Could not fetch snapshot {snap_id}: {e}")
 
     return found_snapshots
 
 
+def get_amis_for_snapshot(ec2_client, snapshot_id):
+    """
+    Directly queries AWS for any AMI (including deprecated/disabled/shared/backup)
+    associated with a specific snapshot ID using native API block-device filters.
+    """
+    ami_details_list = []
+    try:
+        response = ec2_client.describe_images(
+            Filters=[
+                {
+                    "Name": "block-device-mapping.snapshot-id",
+                    "Values": [snapshot_id],
+                }
+            ],
+            IncludeDeprecated=True,  # Crucial for capturing deprecated/archived AMIs
+            IncludeDisabled=True,  # Captures disabled AMIs
+        )
+
+        for image in response.get("Images", []):
+            ami_details_list.append(
+                {
+                    "AmiId": image.get("ImageId"),
+                    "AmiName": image.get("Name", "N/A"),
+                    "AmiState": image.get("State"),
+                    "CreationDate": image.get("CreationDate"),
+                    "OwnerId": image.get("OwnerId", "N/A"),
+                }
+            )
+
+    except ClientError as e:
+        print(f"  [ERROR] Failed to query AMI for {snapshot_id}: {e}")
+
+    return ami_details_list
+
+
 def export_to_csv(results, output_filename):
-    """Exports structured snapshot validation results into a CSV file."""
+    """Exports structured snapshot validation results into a user-friendly CSV file."""
     fieldnames = [
         "AWS Profile",
         "Account ID",
@@ -94,6 +98,7 @@ def export_to_csv(results, output_filename):
         "Associated AMI ID",
         "AMI Name",
         "AMI State",
+        "AMI Owner ID",
         "AMI Creation Date",
     ]
 
@@ -104,11 +109,11 @@ def export_to_csv(results, output_filename):
         writer.writeheader()
         writer.writerows(results)
 
-    print(f"\n[SUCCESS] Report exported successfully to: {output_filename}")
+    print(f"\n[SUCCESS] Validation report exported to: {output_filename}")
 
 
 def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
-    """Loops through profiles and regions, validates snapshots, and exports findings to CSV."""
+    """Loops through profiles and regions, validates snapshots against AMIs, and generates CSV rows."""
     target_snap_ids = load_snapshot_ids_from_file(input_file)
     print(
         f"Loaded {len(target_snap_ids)} unique Snapshot IDs from '{input_file}'."
@@ -143,7 +148,6 @@ def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
                 )
                 continue
 
-            ami_map = get_ami_snapshot_mapping(ec2_client)
             found_snapshots = fetch_snapshots_safely(
                 ec2_client, target_snap_ids
             )
@@ -161,8 +165,11 @@ def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
                     )
                     owner_id = snap_info.get("OwnerId", "N/A")
 
-                    if snap_id in ami_map:
-                        for ami in ami_map[snap_id]:
+                    # Direct lookup for AMIs associated with this specific snapshot ID
+                    associated_amis = get_amis_for_snapshot(ec2_client, snap_id)
+
+                    if associated_amis:
+                        for ami in associated_amis:
                             all_results.append(
                                 {
                                     "AWS Profile": profile,
@@ -177,6 +184,7 @@ def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
                                     "Associated AMI ID": ami["AmiId"],
                                     "AMI Name": ami["AmiName"],
                                     "AMI State": ami["AmiState"],
+                                    "AMI Owner ID": ami["OwnerId"],
                                     "AMI Creation Date": ami["CreationDate"],
                                 }
                             )
@@ -195,6 +203,7 @@ def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
                                 "Associated AMI ID": "N/A",
                                 "AMI Name": "N/A",
                                 "AMI State": "N/A",
+                                "AMI Owner ID": "N/A",
                                 "AMI Creation Date": "N/A",
                             }
                         )
@@ -213,6 +222,7 @@ def process_all_profiles_and_regions(profiles, regions, input_file, output_csv):
                             "Associated AMI ID": "N/A",
                             "AMI Name": "N/A",
                             "AMI State": "N/A",
+                            "AMI Owner ID": "N/A",
                             "AMI Creation Date": "N/A",
                         }
                     )
@@ -227,12 +237,10 @@ if __name__ == "__main__":
     # --- CONFIGURATION ---
     INPUT_FILE = "snapshots.txt"
     OUTPUT_CSV = f"snapshot_ami_validation_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
-    PROFILES = [
-        "default",
-        "production",
-        "staging",
-    ]  # Update with your local AWS profiles
-    REGIONS = ["us-east-1", "us-west-2"]  # Update with your target AWS regions
+    
+    # Configure your AWS Named Profiles and target Regions
+    PROFILES = ["default"]
+    REGIONS = ["us-east-1", "us-east-2"]
 
     process_all_profiles_and_regions(
         PROFILES, REGIONS, INPUT_FILE, OUTPUT_CSV
