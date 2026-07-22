@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>View & Pivot: {{ filename }}</title>
+    
+    <!-- Bootstrap & DataTables CSS -->
+    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootswatch/4.5.2/lux/bootstrap.min.css">
+    <link rel="stylesheet" href="https://cdn.datatables.net/1.11.5/css/dataTables.bootstrap4.min.css">
+    <link rel="stylesheet" href="https://cdn.datatables.net/buttons/2.2.2/css/buttons.bootstrap4.min.css">
+    
+    <style>
+        /* Strict layout enforcement to prevent page stretching */
+        html, body { height: 100vh; margin: 0; padding: 0; overflow: hidden; display: flex; flex-direction: column; background-color: #f4f5f7; }
+        
+        .top-section { 
+            flex: 0 0 auto; 
+            background: #ffffff; 
+            padding: 15px 20px; 
+            border-bottom: 1px solid #e2e8f0; 
+            z-index: 10; 
+            box-shadow: 0 2px 10px rgba(0,0,0,0.05); 
+        }
+        
+        .table-wrapper { 
+            flex: 1 1 auto; 
+            position: relative; 
+            overflow: hidden; 
+            padding: 15px;
+            background: #ffffff;
+            margin: 15px;
+            border-radius: 8px;
+            box-shadow: 0 4px 6px -1px rgba(0, 0, 0, 0.1);
+        }
+
+        /* Ensure DataTables container uses flex to fill remaining height */
+        #csvTable_wrapper { display: flex; flex-direction: column; height: 100%; }
+        .dataTables_scroll { flex: 1 1 auto; overflow: hidden; display: flex; flex-direction: column; }
+        .dataTables_scrollBody { flex: 1 1 auto; overflow-y: auto !important; border-bottom: 1px solid #dee2e6; }
+        
+        /* Force table layout to prevent stretching */
+        table.dataTable { width: 100% !important; margin: 0 !important; border-collapse: collapse !important; }
+        table.dataTable td, table.dataTable th { 
+            white-space: nowrap; 
+            max-width: 250px; 
+            overflow: hidden; 
+            text-overflow: ellipsis; 
+            padding: 8px 12px !important;
+            vertical-align: middle;
+        }
+
+        .pivot-result-box { background: #f8f9fa; border-left: 4px solid #28a745; padding: 15px; margin-top: 15px; max-height: 350px; overflow: auto; border-radius: 4px; }
+        .filter-input { width: 100%; padding: 4px 8px; font-size: 0.85em; border: 1px solid #ced4da; border-radius: 4px; }
+        
+        #loadingIndicator {
+            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
+            background: rgba(255,255,255,0.9); padding: 30px; border-radius: 10px;
+            box-shadow: 0 10px 25px rgba(0,0,0,0.1); z-index: 1000; text-align: center;
+        }
+
+        /* Hide sorting indicators on filter row */
+        .filter-row th::before, .filter-row th::after { display: none !important; }
+    </style>
+</head>
+<body>
+
+    <div class="top-section">
+        <div class="d-flex justify-content-between align-items-center">
+            <div>
+                <a href="/" class="btn btn-secondary btn-sm rounded-pill px-3">&larr; Dashboard</a>
+                <span class="h5 ml-3 align-middle text-dark font-weight-bold mb-0">{{ filename }}</span>
+            </div>
+            <div class="d-flex align-items-center">
+                <span class="text-muted small mr-3">Updated: <strong>{{ file_date }}</strong></span>
+                <button class="btn btn-primary btn-sm rounded-pill px-3" type="button" data-toggle="collapse" data-target="#pivotPanel">Toggle Pivot</button>
+                <a href="/logout" class="btn btn-outline-danger btn-sm rounded-pill px-3 ml-2">Logout</a>
+            </div>
+        </div>
+
+        <div class="collapse {% if pivot_html or pivot_error %}show{% endif %}" id="pivotPanel">
+            <div class="card card-body bg-white border-light shadow-sm mt-3 p-3">
+                <form method="POST">
+                    <div class="form-row align-items-end">
+                        <div class="col-md-2">
+                            <label class="small font-weight-bold text-muted text-uppercase">Rows</label>
+                            <select name="index" class="form-control form-control-sm">
+                                {% for col in columns %}<option value="{{ col }}" {% if sel_index == col %}selected{% endif %}>{{ col }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="small font-weight-bold text-muted text-uppercase">Cols (Opt)</label>
+                            <select name="columns" class="form-control form-control-sm">
+                                <option value="">-- None --</option>
+                                {% for col in columns %}<option value="{{ col }}" {% if sel_columns == col %}selected{% endif %}>{{ col }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="small font-weight-bold text-muted text-uppercase">Values</label>
+                            <select name="values" class="form-control form-control-sm">
+                                {% for col in columns %}<option value="{{ col }}" {% if sel_values == col %}selected{% endif %}>{{ col }}</option>{% endfor %}
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <label class="small font-weight-bold text-muted text-uppercase">Func</label>
+                            <select name="aggfunc" class="form-control form-control-sm">
+                                <option value="sum" {% if sel_agg == 'sum' %}selected{% endif %}>Sum</option>
+                                <option value="mean" {% if sel_agg == 'mean' %}selected{% endif %}>Average</option>
+                                <option value="count" {% if sel_agg == 'count' %}selected{% endif %}>Count</option>
+                                <option value="min" {% if sel_agg == 'min' %}selected{% endif %}>Min</option>
+                                <option value="max" {% if sel_agg == 'max' %}selected{% endif %}>Max</option>
+                            </select>
+                        </div>
+                        <div class="col-md-2">
+                            <button type="submit" class="btn btn-success btn-sm btn-block rounded-pill font-weight-bold" onclick="this.innerHTML='Processing...'; this.disabled=true; this.form.submit();">Generate Pivot</button>
+                        </div>
+                    </div>
+                </form>
+                {% if pivot_error %}<div class="alert alert-danger mt-3 mb-0 p-2 border-0 rounded">{{ pivot_error }}</div>{% endif %}
+                {% if pivot_html %}<div class="pivot-result-box shadow-inner"><h6 class="text-success font-weight-bold">Pivot Result:</h6>{{ pivot_html|safe }}</div>{% endif %}
+            </div>
+        </div>
+    </div>
+
+    <div class="table-wrapper">
+        <div id="loadingIndicator">
+            <div class="spinner-border text-primary" role="status" style="width: 3rem; height: 3rem;"></div>
+            <h6 class="mt-3 mb-0 font-weight-bold text-dark">Processing Data...</h6>
+            <p class="text-muted small mb-0">Rendering table securely</p>
+        </div>
+        <table id="csvTable" class="table table-hover table-bordered mb-0" style="width:100%; display:none;">
+            <thead class="thead-light">
+                <tr>{% for col in columns %}<th>{{ col }}</th>{% endfor %}</tr>
+            </thead>
+            <tbody></tbody>
+        </table>
+    </div>
+
+    <script src="https://code.jquery.com/jquery-3.5.1.min.js"></script>
+    <script src="https://stackpath.bootstrapcdn.com/bootstrap/4.5.2/js/bootstrap.bundle.min.js"></script>
+    <script src="https://cdn.datatables.net/1.11.5/js/jquery.dataTables.min.js"></script>
+    <script src="https://cdn.datatables.net/1.11.5/js/dataTables.bootstrap4.min.js"></script>
+    <script>
+        // Parse the raw JSON payload
+        var tableData = {{ data | tojson }};
+        
+        $(document).ready(function() {
+            // Setup Column Filters
+            var thead = $('#csvTable thead');
+            var tr = $('<tr>').addClass('filter-row');
+            $('#csvTable thead tr:first th').each(function() {
+                var title = $(this).text();
+                var th = $('<th>').addClass('p-1');
+                th.html('<input type="text" class="filter-input" placeholder="Search ' + title + '" />');
+                tr.append(th);
+            });
+            thead.append(tr);
+
+            // Debounce function to prevent UI blocking while typing
+            function debounce(func, wait) {
+                var timeout;
+                return function() {
+                    var context = this, args = arguments;
+                    clearTimeout(timeout);
+                    timeout = setTimeout(function() {
+                        func.apply(context, args);
+                    }, wait);
+                };
+            };
+
+            // Non-blocking initialization
+            setTimeout(function() {
+                var table = $('#csvTable').DataTable({
+                    data: tableData,
+                    
+                    // PERFORMANCE CRITICAL SETTINGS:
+                    autoWidth: false,     // Prevents full table scan to calculate column widths
+                    deferRender: true,    // Only renders HTML elements currently visible on screen
+                    
+                    dom: "<'row mb-2'<'col-sm-12 col-md-6'i><'col-sm-12 col-md-6'f>>" +
+                         "<'row'<'col-sm-12'tr>>" +
+                         "<'row mt-2'<'col-sm-12 col-md-5'l><'col-sm-12 col-md-7'p>>",
+                    scrollX: true,
+                    scrollY: '400px', // Will be overridden dynamically
+                    scrollCollapse: true,
+                    paging: true,
+                    pageLength: 50,
+                    lengthMenu: [ [25, 50, 100, 250], [25, 50, 100, 250] ], // No 'All' option to prevent crashes
+                    orderCellsTop: true,
+                    
+                    initComplete: function() {
+                        var api = this.api();
+                        
+                        // Attach debounced keyup listener to inputs
+                        $('.filter-input').on('keyup change clear', debounce(function () {
+                            var colIdx = $(this).parent().index();
+                            if (api.column(colIdx).search() !== this.value) {
+                                api.column(colIdx).search(this.value).draw();
+                            }
+                        }, 400));
+                        
+                        // Hide loader, show table, and calculate optimal height
+                        $('#loadingIndicator').fadeOut(300, function() {
+                            $('#csvTable').show();
+                            adjustTableHeight();
+                        });
+                    }
+                });
+
+                // Dynamic height calculation to fit viewport perfectly
+                function adjustTableHeight() {
+                    var wrapperHeight = $('.table-wrapper').innerHeight();
+                    var headerHeight = $('.dataTables_scrollHead').outerHeight() || 0;
+                    var topControlsHeight = $('.dataTables_wrapper > .row:first-child').outerHeight() || 0;
+                    var bottomControlsHeight = $('.dataTables_wrapper > .row:last-child').outerHeight() || 0;
+                    
+                    var availableHeight = wrapperHeight - headerHeight - topControlsHeight - bottomControlsHeight - 20;
+                    
+                    if (availableHeight > 150) {
+                        $('.dataTables_scrollBody').css('height', availableHeight + 'px');
+                        table.columns.adjust().draw('page');
+                    }
+                }
+
+                // Attach resize listener with debounce
+                $(window).resize(debounce(adjustTableHeight, 200));
+                $('#pivotPanel').on('shown.bs.collapse hidden.bs.collapse', function() {
+                    setTimeout(adjustTableHeight, 50);
+                });
+                
+            }, 100); 
+        });
+    </script>
+</body>
+</html>
